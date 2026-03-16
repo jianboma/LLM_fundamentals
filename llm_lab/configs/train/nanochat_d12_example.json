@@ -1,0 +1,11 @@
+{
+  "family": "nanochat_style",
+  "extra_args": [
+    "--run=nanochat_local_d12",
+    "--depth=12",
+    "--max-seq-len=256",
+    "--device-batch-size=4",
+    "--num-iterations=200",
+    "--save-every=100"
+  ]
+}

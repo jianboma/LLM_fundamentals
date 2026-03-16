@@ -1,0 +1,28 @@
+{
+  "family": "nanochat_style",
+  "tokenizer": "byte_tokenizer",
+  "chat_template": "nanochat_special_token_conversation",
+  "model": {
+    "sequence_len": 512,
+    "vocab_size": 256,
+    "n_layer": 4,
+    "n_head": 4,
+    "n_embd": 256
+  },
+  "training": {
+    "notes": "Runs llm_lab.nanochat_style.train local pipeline.",
+    "default_args": [
+      "--run=nanochat_local_d12",
+      "--depth=12",
+      "--max-seq-len=256",
+      "--device-batch-size=4",
+      "--num-iterations=200",
+      "--save-every=100"
+    ]
+  },
+  "inference": {
+    "source": "local",
+    "device_type": "cpu",
+    "model_tag": "llm_lab_outputs/nanochat_style"
+  }
+}
