@@ -6,7 +6,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
+# Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
+from nanochat.flash_attention import flash_attn
+
 from .configuration_gpt2 import GPT2Config
+
 @dataclass
 class GPT2ModelOutputWithPast:
     last_hidden_state: torch.Tensor
@@ -82,12 +87,13 @@ def _make_attn_bias(
     device: torch.device,
     dtype: torch.dtype,
     q_offset: int,
-    window_size: int,
+    window_size: tuple[int, int],
 ) -> torch.Tensor:
     q_pos = torch.arange(q_offset, q_offset + q_len, device=device)
     k_pos = torch.arange(k_len, device=device)
     allow = k_pos[None, :] <= q_pos[:, None]
-    if window_size > 0:
+    lef_window = window_size[0]
+    if lef_window > 0:
         allow = allow & ((q_pos[:, None] - k_pos[None, :]) < window_size)
     min_value = torch.finfo(dtype).min
     return torch.where(allow, torch.zeros(1, device=device, dtype=dtype), min_value)
@@ -122,55 +128,54 @@ class GPT2Attention(nn.Module):
         ve: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        window_size: int,
+        window_size: tuple[int, int],
         attention_mask: torch.Tensor | None,
         past_key_values: GPT2DynamicCache | None,
     ) -> torch.Tensor:
-        bsz, q_len, _ = x.shape
-        q = self.c_q(x).view(bsz, q_len, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).view(bsz, q_len, self.n_kv_head, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).view(bsz, q_len, self.n_kv_head, self.head_dim).transpose(1, 2)
 
+        B, T, C = x.size()
+
+        # Project the input to get queries, keys, and values
+        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
-            ve = ve.view(bsz, q_len, self.n_kv_head, self.head_dim).transpose(1, 2)
-            gate = 3.0 * torch.sigmoid(self.ve_gate(x[..., : self.ve_gate_channels])).transpose(1, 2).unsqueeze(-1)
-            v = v + gate * ve
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
+            v = v + gate.unsqueeze(-1) * ve
 
-        q = _apply_rotary_emb(q, cos, sin)
-        k = _apply_rotary_emb(k, cos, sin)
-        q = _rms_norm(q) * 1.15
-        k = _rms_norm(k) * 1.15
+        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        q, k = _apply_rotary_emb(q, cos, sin), _apply_rotary_emb(k, cos, sin)
+        q, k = _rms_norm(q), _rms_norm(k) # QK norm
+        q = q * 1.15  # sharper attention (split scale between Q and K), TODO think through better
+        k = k * 1.15
 
-        q_offset = 0
-        if past_key_values is not None:
-            q_offset = past_key_values.get_seq_length(self.layer_idx)
-            k, v = past_key_values.update(k, v, self.layer_idx)
-        k_len = k.shape[2]
+        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
+        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        if past_key_values is None or past_key_values.key_cache[self.layer_idx] is None:
+            # Training: causal attention with optional sliding window
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            # Inference: use flash_attn_with_kvcache which handles cache management
+            k_cache, v_cache = past_key_values.key_cache[self.layer_idx], past_key_values.value_cache[self.layer_idx]
+            y = flash_attn.flash_attn_with_kvcache(
+                q, k_cache, v_cache,
+                k=k, v=v,
+                cache_seqlens=past_key_values.get_seq_length(),
+                causal=True,
+                window_size=window_size,
+            )
+            # Advance position after last layer processes
+            if self.layer_idx == past_key_values.n_layers - 1:
+                past_key_values.update(T)
 
-        n_rep = self.n_head // self.n_kv_head
-        k = _repeat_kv(k, n_rep)
-        v = _repeat_kv(v, n_rep)
-
-        attn_bias = _make_attn_bias(
-            q_len=q_len,
-            k_len=k_len,
-            device=x.device,
-            dtype=x.dtype,
-            q_offset=q_offset,
-            window_size=window_size,
-        )
-        attn_weights = (q @ k.transpose(-1, -2)) * self.scale
-        attn_weights = attn_weights + attn_bias[None, None, :, :]
-
-        if attention_mask is not None:
-            # attention_mask is expected as [B, K], where 1=keep, 0=mask.
-            mask = (1.0 - attention_mask[:, None, None, :].to(dtype=x.dtype)) * torch.finfo(x.dtype).min
-            attn_weights = attn_weights + mask
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        y = attn_weights @ v
-        y = y.transpose(1, 2).contiguous().view(bsz, q_len, self.n_embd)
-        return self.c_proj(y)
+        # Re-assemble the heads and project back to residual stream
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
 
 
 class GPT2MLP(nn.Module):
@@ -195,7 +200,7 @@ class GPT2Block(nn.Module):
         ve: torch.Tensor | None,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        window_size: int,
+        window_size: tuple[int, int],
         attention_mask: torch.Tensor | None,
         past_key_values: GPT2DynamicCache | None,
     ) -> torch.Tensor:
@@ -246,6 +251,19 @@ class GPT2TextModel(nn.Module):
         self.x0_lambdas.fill_(0.1)
         for ve in self.value_embeds.values():
             nn.init.uniform_(ve.weight, -s, s)
+        
+        # Rotary embeddings
+        head_dim = self.config.n_embd // self.config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = cos, sin
+
+        # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
+        # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
+        # because GradScaler cannot unscale fp16 gradients.
+        if COMPUTE_DTYPE != torch.float16:
+            self.embed_tokens.to(COMPUTE_DTYPE)
+            for ve in self.value_embeds.values():
+                ve.to(COMPUTE_DTYPE)
 
     @staticmethod
     def _precompute_rotary_embeddings(seq_len: int, head_dim: int, base: float = 100000.0) -> tuple[torch.Tensor, torch.Tensor]:
@@ -254,17 +272,38 @@ class GPT2TextModel(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        return cos[None, None, :, :], sin[None, None, :, :]
+        cos, sin = cos.to(COMPUTE_DTYPE), sin.to(COMPUTE_DTYPE)
+        return cos[None, :, None, :], sin[None, :, None, :]
 
     @staticmethod
-    def _compute_window_sizes(config: GPT2Config) -> list[int]:
+    def _compute_window_sizes(config: GPT2Config) -> list[tuple[int, int]]:
+        """
+        Compute per-layer window sizes for sliding window attention.
+
+        Returns list of (left, right) tuples for FA3's window_size parameter:
+        - left: how many tokens before current position to attend to (-1 = unlimited)
+        - right: how many tokens after current position to attend to (0 for causal)
+
+        Pattern string is tiled across layers. Final layer always gets L (full context).
+        Characters: L=long (full context), S=short (half context)
+        """
         pattern = config.window_pattern.upper()
+        assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
+        # Map characters to window sizes
         long_window = config.sequence_len
-        short_window = -(-long_window // 3 // 128) * 128
-        char_to_window = {"L": long_window, "S": short_window}
-        windows = [char_to_window[pattern[i % len(pattern)]] for i in range(config.n_layer)]
-        windows[-1] = long_window
-        return windows
+        short_window = -(-long_window // 3 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
+        char_to_window = {
+            "L": (long_window, 0),
+            "S": (short_window, 0),
+        }
+        # Tile pattern across layers
+        window_sizes = []
+        for layer_idx in range(config.n_layer):
+            char = pattern[layer_idx % len(pattern)]
+            window_sizes.append(char_to_window[char])
+        # Final layer always gets full context
+        window_sizes[-1] = (long_window, 0)
+        return window_sizes
 
     def forward(
         self,
@@ -284,12 +323,14 @@ class GPT2TextModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        inputs_embeds = inputs_embeds.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but activae for fp16 code path)
+
         bsz, seq_len, _ = inputs_embeds.shape
         past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
-        if past_len + seq_len > self.cos.shape[2]:
+        if past_len + seq_len > self.cos.shape[1]:
             raise ValueError("Sequence length exceeded precomputed rotary cache.")
-        cos = self.cos[:, :, past_len : past_len + seq_len, :].to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
-        sin = self.sin[:, :, past_len : past_len + seq_len, :].to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        cos = self.cos[:, past_len : past_len + seq_len, ].to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        sin = self.sin[:, past_len : past_len + seq_len, ].to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
 
         x = _rms_norm(inputs_embeds)
         x0 = x
@@ -355,6 +396,7 @@ class GPT2ForCausalLM(nn.Module):
         t = self.config.sequence_len
         attn_flops = 0
         for window in self.model.window_sizes:
+            window = window[0] # (left, right) tuple, we use left
             effective_seq = min(window, t)
             attn_flops += 12 * h * q * effective_seq
         return 6 * (nparams - nparams_exclude) + attn_flops
@@ -507,7 +549,8 @@ class GPT2ForCausalLM(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values: GPT2DynamicCache | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        labels: torch.LongTensor | None = None,
+        targets: torch.LongTensor | None = None,
+        loss_reduction: str | None = 'mean',
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
     ) -> GPT2CausalLMOutputWithPast:
@@ -523,18 +566,20 @@ class GPT2ForCausalLM(nn.Module):
             slice_indices = slice(-logits_to_keep, None)
         else:
             slice_indices = slice(None)
-        logits = self.lm_head(hidden_states[:, slice_indices, :])[..., : self.config.vocab_size]
-        logits = 15.0 * torch.tanh(logits.float() / 15.0)
+        
+        # Forward the lm_head (compute logits)
+        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        logits = self.lm_head(hidden_states[:, slice_indices, :]) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+        logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        logits = logits.float() # switch to fp32 for logit softcap and loss computation
+        logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
         loss = None
-        if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+        if targets is not None:
+            # training: given the targets, compute and return the loss
+            # TODO experiment with chunked cross-entropy?
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+
         return GPT2CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=outputs.past_key_values)
 
     @torch.no_grad()
